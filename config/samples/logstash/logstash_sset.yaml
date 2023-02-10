@@ -27,6 +27,25 @@ spec:
       config.string: |-
         input { exec { command => 'uptime' interval => 10 } }
         output { stdout{} }
+  services:
+    - name: metric
+      service:
+        spec:
+          type: ClusterIP
+          ports:
+            - port: 9600
+              name: "stats"
+              protocol: TCP
+              targetPort: 9600
+    - name: plugin
+      service:
+        spec:
+          type: ClusterIP
+          ports:
+            - port: 1234
+              name: "input"
+              protocol: TCP
+              targetPort: 1234
   statefulSet:
     replicas: 1
     podTemplate:

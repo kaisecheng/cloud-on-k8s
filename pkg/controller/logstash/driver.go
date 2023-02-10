@@ -6,9 +6,7 @@ package logstash
 
 import (
 	"context"
-	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common/certificates"
-	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common/defaults"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common/events"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/logstash/stackmon"
 	"hash/fnv"
@@ -25,7 +23,6 @@ import (
 	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common/tracing"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common/version"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/common/watches"
-	"github.com/elastic/cloud-on-k8s/v2/pkg/controller/logstash/network"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/k8s"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/log"
 )
@@ -95,11 +92,14 @@ func internalReconcile(params Params) (*reconciler.Results, logstashv1alpha1.Log
 		return results, params.Status // will eventually retry
 	}
 
-	svc, err := common.ReconcileService(params.Context, params.Client, newService(params.Logstash), &params.Logstash)
+	svcs, err := reconcileServices(params)
 	if err != nil {
 		return results.WithError(err), params.Status
 	}
 
+	//TODO we need to make decision on how to handle secure metric API
+	// 1. Logstash use different TLS format and allow combining with HTTP Basic auth (https://github.com/elastic/logstash/issues/13196)
+	// 2. Having two places to config service could be confusing, `Services []LogstashService` vs `HTTP commonv1.HTTPConfig`
 	_, results = certificates.Reconciler{
 		K8sClient:             params.Client,
 		DynamicWatches:        params.Watches,
@@ -107,7 +107,7 @@ func internalReconcile(params Params) (*reconciler.Results, logstashv1alpha1.Log
 		TLSOptions:            params.Logstash.Spec.HTTP.TLS,
 		Namer:                 logstashv1alpha1.Namer,
 		Labels:                NewLabels(params.Logstash),
-		Services:              []corev1.Service{*svc},
+		Services:              svcs,
 		GlobalCA:              params.OperatorParams.GlobalCA,
 		CACertRotation:        params.OperatorParams.CACertRotation,
 		CertRotation:          params.OperatorParams.CertRotation,
@@ -121,7 +121,7 @@ func internalReconcile(params Params) (*reconciler.Results, logstashv1alpha1.Log
 
 	configHash := fnv.New32a()
 
-	// reconcile beats config secrets if Stack Monitoring is defined
+	// reconcile stack monitoring config secrets if Stack Monitoring is defined
 	err = stackmon.ReconcileConfigSecrets(params.Context, params.Client, params.Logstash)
 	if err != nil {
 		return results.WithError(err), params.Status
@@ -154,24 +154,4 @@ func internalReconcile(params Params) (*reconciler.Results, logstashv1alpha1.Log
 		return results.WithError(err), params.Status
 	}
 	return reconcilePodVehicle(params, podTemplate)
-}
-
-func newService(logstash logstashv1alpha1.Logstash) *corev1.Service {
-	svc := corev1.Service{
-		ObjectMeta: logstash.Spec.HTTP.Service.ObjectMeta,
-		Spec:       logstash.Spec.HTTP.Service.Spec,
-	}
-
-	svc.ObjectMeta.Namespace = logstash.Namespace
-	svc.ObjectMeta.Name = logstashv1alpha1.HTTPServiceName(logstash.Name)
-
-	labels := NewLabels(logstash)
-	ports := []corev1.ServicePort{
-		{
-			Name:     logstash.Spec.HTTP.Protocol(),
-			Protocol: corev1.ProtocolTCP,
-			Port:     network.HTTPPort,
-		},
-	}
-	return defaults.SetServiceDefaults(&svc, labels, labels, ports)
 }

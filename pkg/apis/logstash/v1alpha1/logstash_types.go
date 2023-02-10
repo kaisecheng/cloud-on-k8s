@@ -77,7 +77,13 @@ type LogstashSpec struct {
 	// RevisionHistoryLimit is the number of revisions to retain to allow rollback in the underlying DaemonSet or Deployment.
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty"`
 
-	// HTTP holds the HTTP layer configuration for the Agent in Fleet mode with Fleet Server enabled.
+	// Services is a list of Service configuration for Logstash
+	// When it is empty, a default Service for port 9600 is created.
+	// When it is not empty, the port 9600 does not attach to any of Service.
+	// +kubebuilder:validation:Optional
+	Services []LogstashService `json:"services,omitempty"`
+
+	// HTTP holds the HTTP layer configuration for Logstash metrics API.
 	// +kubebuilder:validation:Optional
 	HTTP commonv1.HTTPConfig `json:"http,omitempty"`
 
@@ -106,6 +112,13 @@ type StatefulSetSpec struct {
 	// Items defined here take precedence over any default claims added by the operator with the same name.
 	// +kubebuilder:validation:Optional
 	VolumeClaimTemplates []corev1.PersistentVolumeClaim `json:"volumeClaimTemplates,omitempty"`
+}
+
+// LogstashService defines the service of Logstash
+type LogstashService struct {
+	Name string `json:"name,omitempty"`
+	// Service defines the template for the associated Kubernetes Service
+	Service commonv1.ServiceTemplate `json:"service,omitempty"`
 }
 
 // LogstashStatus defines the observed state of Logstash
