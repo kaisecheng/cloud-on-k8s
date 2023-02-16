@@ -1,0 +1,81 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: monitoring
+spec:
+  version: 8.5.0
+  nodeSets:
+    - name: default
+      count: 1
+      config:
+        node.store.allow_mmap: false
+---
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch-sample
+spec:
+  version: 8.5.0
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+        - name: monitoring
+    logs:
+      elasticsearchRefs:
+        - name: monitoring
+  nodeSets:
+    - name: default
+      count: 1
+      config:
+        node.store.allow_mmap: false
+---
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-sample
+spec:
+  version: 8.5.0
+  elasticsearchRef:
+    name: elasticsearch-sample
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+        - name: monitoring
+    logs:
+      elasticsearchRefs:
+        - name: monitoring
+  config:
+    log.level: info
+    api.http.host: "0.0.0.0"
+    queue.type: memory
+  pipelines:
+    - pipeline.id: main
+      config.string: |-
+        input { exec { command => 'uptime' interval => 10 } }
+        output { stdout{} }
+  statefulSet:
+    replicas: 1
+    podTemplate:
+      spec:
+        containers:
+          - name: logstash
+#            demo sending log through filebeat to monitoring
+            command: ['sh', '-c', 'curl -o "log4j2.properties" "https://raw.githubusercontent.com/elastic/logstash/main/config/log4j2.properties" && mv log4j2.properties config/log4j2.properties && /usr/local/bin/docker-entrypoint']
+---
+apiVersion: kibana.k8s.elastic.co/v1
+kind: Kibana
+metadata:
+  name: kibana-sample
+spec:
+  version: 8.5.0
+  elasticsearchRef:
+    name: monitoring
+  monitoring:
+    metrics:
+      elasticsearchRefs:
+        - name: monitoring
+    logs:
+      elasticsearchRefs:
+        - name: monitoring
+  count: 1
+---

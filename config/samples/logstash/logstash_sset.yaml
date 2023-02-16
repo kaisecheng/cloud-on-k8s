@@ -1,0 +1,65 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch-sample
+spec:
+  version: 8.5.0
+  nodeSets:
+    - name: default
+      count: 1
+      config:
+        node.store.allow_mmap: false
+---
+apiVersion: logstash.k8s.elastic.co/v1alpha1
+kind: Logstash
+metadata:
+  name: logstash-sample
+spec:
+  version: 8.5.0
+  elasticsearchRef:
+    name: elasticsearch-sample
+  config:
+    log.level: info
+    api.http.host: "0.0.0.0"
+    queue.type: memory
+  pipelines:
+    - pipeline.id: main
+      config.string: |-
+        input { exec { command => 'uptime' interval => 10 } }
+        output { stdout{} }
+  services:
+    - name: metric
+      service:
+        spec:
+          type: ClusterIP
+          ports:
+            - port: 9600
+              name: "stats"
+              protocol: TCP
+              targetPort: 9600
+    - name: plugin
+      service:
+        spec:
+          type: ClusterIP
+          ports:
+            - port: 1234
+              name: "input"
+              protocol: TCP
+              targetPort: 1234
+  statefulSet:
+    replicas: 1
+    podTemplate:
+      spec:
+        containers:
+          - name: logstash
+#            volumeMounts:
+#              - name: logstash-data
+#                mountPath: /usr/share/logstash/data
+#    volumeClaimTemplates:
+#      - metadata:
+#          name: logstash-data
+#        spec:
+#          accessModes: [ "ReadWriteOnce" ]
+#          resources:
+#            requests:
+#              storage: 2Gi
