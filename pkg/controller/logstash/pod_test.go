@@ -23,6 +23,7 @@ import (
 	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/common/container"
 	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/common/pod"
 	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/common/version"
+	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/common/watches"
 	"github.com/elastic/cloud-on-k8s/v3/pkg/controller/logstash/configs"
 	lslabels "github.com/elastic/cloud-on-k8s/v3/pkg/controller/logstash/labels"
 	"github.com/elastic/cloud-on-k8s/v3/pkg/utils/k8s"
@@ -339,6 +340,7 @@ func TestNewPodTemplateSpec(t *testing.T) {
 				Client:          k8s.NewFakeClient(&testHTTPCertsInternalSecret),
 				Logstash:        tt.logstash,
 				APIServerConfig: tt.apiServerConfig,
+				Watches:         watches.NewDynamicWatches(),
 			}
 			configHash := fnv.New32a()
 			got, err := buildPodTemplate(params, configHash)
@@ -347,6 +349,218 @@ func TestNewPodTemplateSpec(t *testing.T) {
 			tt.assertions(got)
 		})
 	}
+}
+
+func TestWriteUserCertSecretsToConfigHash(t *testing.T) {
+	ls := logstashv1alpha1.Logstash{
+		ObjectMeta: metav1.ObjectMeta{Name: "logstash-sample", Namespace: "default"},
+	}
+
+	certSecret := corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-certs", Namespace: "default"},
+		Data: map[string][]byte{
+			"tls.crt":    []byte("cert-data"),
+			"tls.key":    []byte("key-data"),
+			"config.yml": []byte("non-cert-data"),
+		},
+	}
+
+	withSecretVolume := func(secretName string) logstashv1alpha1.Logstash {
+		ls := ls
+		ls.Spec.PodTemplate.Spec.Volumes = []corev1.Volume{
+			{Name: "certs", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secretName}}},
+		}
+		return ls
+	}
+
+	hashOf := func(params Params) uint32 {
+		h := fnv.New32a()
+		err := writeUserCertSecretsToConfigHash(params, h)
+		require.NoError(t, err)
+		return h.Sum32()
+	}
+
+	t.Run("cert and key values contribute to hash", func(t *testing.T) {
+		paramsWithCerts := Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(&certSecret),
+			Logstash: withSecretVolume("my-certs"),
+			Watches:  watches.NewDynamicWatches(),
+		}
+		emptyHash := fnv.New32a().Sum32()
+		assert.NotEqual(t, emptyHash, hashOf(paramsWithCerts))
+	})
+
+	t.Run("hash changes when cert value changes", func(t *testing.T) {
+		params := func(certData string) Params {
+			s := certSecret.DeepCopy()
+			s.Data["tls.crt"] = []byte(certData)
+			return Params{
+				Context:  context.Background(),
+				Client:   k8s.NewFakeClient(s),
+				Logstash: withSecretVolume("my-certs"),
+				Watches:  watches.NewDynamicWatches(),
+			}
+		}
+		assert.NotEqual(t, hashOf(params("old-cert")), hashOf(params("new-cert")))
+	})
+
+	t.Run("non-cert keys do not affect hash", func(t *testing.T) {
+		params := func(configData string) Params {
+			s := certSecret.DeepCopy()
+			s.Data["config.yml"] = []byte(configData)
+			return Params{
+				Context:  context.Background(),
+				Client:   k8s.NewFakeClient(s),
+				Logstash: withSecretVolume("my-certs"),
+				Watches:  watches.NewDynamicWatches(),
+			}
+		}
+		assert.Equal(t, hashOf(params("value-a")), hashOf(params("value-b")))
+	})
+
+	t.Run("missing secret is skipped without error", func(t *testing.T) {
+		params := Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(),
+			Logstash: withSecretVolume("does-not-exist"),
+			Watches:  watches.NewDynamicWatches(),
+		}
+		h := fnv.New32a()
+		require.NoError(t, writeUserCertSecretsToConfigHash(params, h))
+		assert.Equal(t, fnv.New32a().Sum32(), h.Sum32())
+	})
+
+	t.Run("no volumes produces no hash contribution", func(t *testing.T) {
+		params := Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(&certSecret),
+			Logstash: ls,
+			Watches:  watches.NewDynamicWatches(),
+		}
+		h := fnv.New32a()
+		require.NoError(t, writeUserCertSecretsToConfigHash(params, h))
+		assert.Equal(t, fnv.New32a().Sum32(), h.Sum32())
+	})
+
+	t.Run("multiple secret volumes all contribute to hash", func(t *testing.T) {
+		secret1 := corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "certs-a"},
+			Data:       map[string][]byte{"tls.crt": []byte("cert-a-data")},
+		}
+		secret2 := corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "certs-b"},
+			Data:       map[string][]byte{"tls.crt": []byte("cert-b-data")},
+		}
+		withTwoVolumes := logstashv1alpha1.Logstash{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "ls"},
+			Spec: logstashv1alpha1.LogstashSpec{
+				PodTemplate: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Volumes: []corev1.Volume{
+							{Name: "vol-a", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "certs-a"}}},
+							{Name: "vol-b", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "certs-b"}}},
+						},
+					},
+				},
+			},
+		}
+
+		hashBoth := fnv.New32a()
+		require.NoError(t, writeUserCertSecretsToConfigHash(Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(&secret1, &secret2),
+			Logstash: withTwoVolumes,
+			Watches:  watches.NewDynamicWatches(),
+		}, hashBoth))
+		sumBoth := hashBoth.Sum32()
+
+		hashOnlyA := fnv.New32a()
+		require.NoError(t, writeUserCertSecretsToConfigHash(Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(&secret1),
+			Logstash: withTwoVolumes,
+			Watches:  watches.NewDynamicWatches(),
+		}, hashOnlyA))
+		sumOnlyA := hashOnlyA.Sum32()
+
+		assert.NotEqual(t, sumBoth, sumOnlyA, "removing a secret should change the hash")
+	})
+
+	t.Run("hash is deterministic across repeated calls", func(t *testing.T) {
+		params := Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(&certSecret),
+			Logstash: withSecretVolume("my-certs"),
+			Watches:  watches.NewDynamicWatches(),
+		}
+		assert.Equal(t, hashOf(params), hashOf(params))
+	})
+
+	t.Run("projected volume secret contributes to hash", func(t *testing.T) {
+		projected := logstashv1alpha1.Logstash{
+			ObjectMeta: metav1.ObjectMeta{Name: "logstash-sample", Namespace: "default"},
+			Spec: logstashv1alpha1.LogstashSpec{
+				PodTemplate: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Volumes: []corev1.Volume{{
+							Name: "projected-certs",
+							VolumeSource: corev1.VolumeSource{
+								Projected: &corev1.ProjectedVolumeSource{
+									Sources: []corev1.VolumeProjection{{
+										Secret: &corev1.SecretProjection{
+											LocalObjectReference: corev1.LocalObjectReference{Name: "my-certs"},
+										},
+									}},
+								},
+							},
+						}},
+					},
+				},
+			},
+		}
+		params := func(certData string) Params {
+			s := certSecret.DeepCopy()
+			s.Data["tls.crt"] = []byte(certData)
+			return Params{
+				Context:  context.Background(),
+				Client:   k8s.NewFakeClient(s),
+				Logstash: projected,
+				Watches:  watches.NewDynamicWatches(),
+			}
+		}
+		assert.NotEqual(t, hashOf(params("old-cert")), hashOf(params("new-cert")))
+	})
+
+	t.Run("projected volume with empty secret name is skipped", func(t *testing.T) {
+		projected := logstashv1alpha1.Logstash{
+			ObjectMeta: metav1.ObjectMeta{Name: "logstash-sample", Namespace: "default"},
+			Spec: logstashv1alpha1.LogstashSpec{
+				PodTemplate: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Volumes: []corev1.Volume{{
+							Name: "projected-empty",
+							VolumeSource: corev1.VolumeSource{
+								Projected: &corev1.ProjectedVolumeSource{
+									Sources: []corev1.VolumeProjection{{
+										Secret: &corev1.SecretProjection{},
+									}},
+								},
+							},
+						}},
+					},
+				},
+			},
+		}
+		h := fnv.New32a()
+		require.NoError(t, writeUserCertSecretsToConfigHash(Params{
+			Context:  context.Background(),
+			Client:   k8s.NewFakeClient(),
+			Logstash: projected,
+			Watches:  watches.NewDynamicWatches(),
+		}, h))
+		assert.Equal(t, fnv.New32a().Sum32(), h.Sum32())
+	})
 }
 
 // GetLogstashContainer returns the Logstash container from the given podSpec.

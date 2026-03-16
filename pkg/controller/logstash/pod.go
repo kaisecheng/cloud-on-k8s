@@ -8,9 +8,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"hash"
+	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -86,6 +88,10 @@ func buildPodTemplate(params Params, configHash hash.Hash32) (corev1.PodTemplate
 	}
 
 	if err := writeHTTPSCertsToConfigHash(params, configHash); err != nil {
+		return corev1.PodTemplateSpec{}, err
+	}
+
+	if err := writeUserCertSecretsToConfigHash(params, configHash); err != nil {
 		return corev1.PodTemplateSpec{}, err
 	}
 
@@ -224,6 +230,54 @@ func getHTTPSInternalCertsSecret(params Params) (corev1.Secret, error) {
 	}
 
 	return httpCerts, nil
+}
+
+// writeUserCertSecretsToConfigHash hashes .crt/.key values from user-provided secret volumes
+// into the config hash, triggering a pod restart when mounted TLS certificates are rotated.
+// Both direct secret volumes and projected volume secret sources are covered.
+// All keys in each secret are scanned; only keys ending in .crt or .key contribute to the hash.
+func writeUserCertSecretsToConfigHash(params Params, configHash hash.Hash) error {
+	for _, vol := range params.Logstash.Spec.PodTemplate.Spec.Volumes {
+		if vol.Secret != nil && vol.Secret.SecretName != "" {
+			if err := hashCertSecret(params, configHash, vol.Secret.SecretName); err != nil {
+				return err
+			}
+		}
+		if vol.Projected != nil {
+			for _, src := range vol.Projected.Sources {
+				if src.Secret != nil && src.Secret.Name != "" {
+					if err := hashCertSecret(params, configHash, src.Secret.Name); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// hashCertSecret fetches a secret and writes the values of all .crt and .key keys into configHash.
+func hashCertSecret(params Params, configHash hash.Hash, secretName string) error {
+	var secret corev1.Secret
+	nsn := types.NamespacedName{Namespace: params.Logstash.Namespace, Name: secretName}
+	if err := params.Client.Get(params.Context, nsn, &secret); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	var certKeys []string
+	for key := range secret.Data {
+		if strings.HasSuffix(key, ".crt") || strings.HasSuffix(key, ".key") {
+			certKeys = append(certKeys, key)
+		}
+	}
+	sort.Strings(certKeys)
+	for _, key := range certKeys {
+		_, _ = configHash.Write([]byte(key))
+		_, _ = configHash.Write(secret.Data[key])
+	}
+	return nil
 }
 
 // writeHTTPSCertsToConfigHash fetches the http-certs-internal secret and adds the content of tls.crt to checksum
